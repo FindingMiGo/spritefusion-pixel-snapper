@@ -184,7 +184,7 @@ pub fn process_image(
         }
         config.k_colors = k as usize;
     }
-    
+
     config.pixel_size_override = pixel_size_override;
 
     process_image_bytes_common(input_bytes, Some(config))
@@ -205,33 +205,35 @@ fn parse_args() -> Option<Config> {
         ..Default::default()
     };
 
-    if let Some(k_arg) = args.get(3) {
-        if !k_arg.starts_with("--") {
-            match k_arg.parse::<usize>() {
-                Ok(k) if k > 0 => config.k_colors = k,
-                _ => eprintln!(
-                    "Warning: invalid k_colors '{}', falling back to default ({})",
-                    k_arg, config.k_colors
-                ),
-            }
-        }
-    }
-
     let mut i = 3;
     while i < args.len() {
-        if args[i] == "--pixel-size" {
-            if let Some(val) = args.get(i + 1) {
+        match args[i].as_str() {
+            "--pixel-size" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!("Warning: --pixel-size requires a value");
+                    break;
+                };
+
                 match val.parse::<f64>() {
-                    Ok(px) if px > 0.0 => config.pixel_size_override = Some(px),
+                    Ok(px) if px.is_finite() && px > 0.0 => config.pixel_size_override = Some(px),
                     _ => eprintln!("Warning: invalid --pixel-size '{}', ignoring", val),
                 }
                 i += 2;
-            } else {
-                eprintln!("Warning: --pixel-size requires a value");
+            }
+            arg if arg.starts_with("--") => {
+                eprintln!("Warning: unknown argument '{}', ignoring", arg);
                 i += 1;
             }
-        } else {
-            i += 1;
+            k_arg => {
+                match k_arg.parse::<usize>() {
+                    Ok(k) if k > 0 => config.k_colors = k,
+                    _ => eprintln!(
+                        "Warning: invalid k_colors '{}', falling back to default ({})",
+                        k_arg, config.k_colors
+                    ),
+                }
+                i += 1;
+            }
         }
     }
 
