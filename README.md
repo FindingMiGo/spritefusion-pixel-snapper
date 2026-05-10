@@ -69,20 +69,11 @@ cargo run input.png output.png --grid-size 32x32
 
 This does not use linear interpolation. The input is split into the requested grid, snapped near detected pixel boundaries, and each output pixel uses the most common color in its source cell.
 
-When grid size is auto-detected, Pixel Snapper now compares multiple grid candidates using edge alignment, autocorrelation, line-mesh detection, and reconstruction error before choosing the final grid.
-
-To choose how each source cell becomes one output pixel, use `--resample`:
+Each run prints a short quality summary. To save a detailed report and a source-size diff mask:
 
 ```bash
-cargo run input.png output.png --resample center
-cargo run input.png output.png --resample mean
-cargo run input.png output.png --resample edge-aware --edge-weight 1.5
-cargo run input.png output.png --palette "#000000 #ffffff #ff0044" --resample palette-aware
+cargo run input.png output.png --report quality.txt --diff diff.png
 ```
-
-Available modes are `majority` (default), `center`, `mean`, `edge-aware`, and `palette-aware`. `center` can preserve crisp aligned sprites, `mean` keeps the average visual color, `edge-aware` gives stronger edge pixels more voting weight, and `palette-aware` snaps each cell average to a custom palette.
-
-`--palette` accepts an inline list of `#rrggbb` colors or a text/CSV file containing RGB colors.
 
 ### 🌐 Web (WASM)
 
@@ -109,9 +100,6 @@ const outputBytes = process_image(inputBytes, 16);
 
 // process_image_with_grid(inputBytes, kColors?, pixelSizeOverride?, width, height)
 const fixedSizeOutputBytes = process_image_with_grid(inputBytes, 16, null, 32, 32);
-
-// process_image_with_options(inputBytes, kColors?, pixelSizeOverride?, width?, height?, mode?, edgeWeight?, palette?)
-const centerSampledBytes = process_image_with_options(inputBytes, 16, null, 32, 32, "center", null, null);
 ```
 
 Pass `null` for any optional argument you want to leave on its default behavior.
