@@ -18,6 +18,8 @@ use wasm_bindgen::prelude::*;
 pub struct Config {
     pub k_colors: usize,
     pub pixel_size_override: Option<f64>,
+    pub target_grid_width: Option<usize>,
+    pub target_grid_height: Option<usize>,
     k_seed: u64,
     /// Input image path only used for CLI use
     #[allow(dead_code)]
@@ -53,6 +55,8 @@ impl Default for Config {
             fallback_target_segments: 64,
             max_step_ratio: 1.8, // Lowered from 3.0 to catch more skew cases
             pixel_size_override: None,
+            target_grid_width: None,
+            target_grid_height: None,
         }
     }
 }
@@ -116,6 +120,14 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
             )));
         }
     }
+    if let (Some(target_w), Some(target_h)) = (config.target_grid_width, config.target_grid_height)
+    {
+        validate_target_grid_size(target_w, target_h, width as usize, height as usize)?;
+    } else if config.target_grid_width.is_some() || config.target_grid_height.is_some() {
+        return Err(PixelSnapperError::InvalidInput(
+            "target grid width and height must both be provided".to_string(),
+        ));
+    }
 
     let rgba_img = img.to_rgba8();
 
@@ -139,19 +151,29 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
         }
     );
 
-    let raw_col_cuts = walk(&profile_x, step_x, width as usize, &config)?;
-    let raw_row_cuts = walk(&profile_y, step_y, height as usize, &config)?;
+    let (col_cuts, row_cuts) = if let (Some(target_w), Some(target_h)) =
+        (config.target_grid_width, config.target_grid_height)
+    {
+        println!("Target grid size: {}x{}", target_w, target_h);
+        (
+            snap_grid_size_cuts(&profile_x, width as usize, target_w, &config),
+            snap_grid_size_cuts(&profile_y, height as usize, target_h, &config),
+        )
+    } else {
+        let raw_col_cuts = walk(&profile_x, step_x, width as usize, &config)?;
+        let raw_row_cuts = walk(&profile_y, step_y, height as usize, &config)?;
 
-    // Two-pass stabilization: first pass with raw cuts, then cross-validate
-    let (col_cuts, row_cuts) = stabilize_both_axes(
-        &profile_x,
-        &profile_y,
-        raw_col_cuts,
-        raw_row_cuts,
-        width as usize,
-        height as usize,
-        &config,
-    );
+        // Two-pass stabilization: first pass with raw cuts, then cross-validate
+        stabilize_both_axes(
+            &profile_x,
+            &profile_y,
+            raw_col_cuts,
+            raw_row_cuts,
+            width as usize,
+            height as usize,
+            &config,
+        )
+    };
 
     println!("Output size: {}x{}", col_cuts.len() - 1, row_cuts.len() - 1);
 
@@ -191,6 +213,34 @@ pub fn process_image(
         .map_err(|e| wasm_bindgen::JsValue::from(e))
 }
 
+/// WASM entry point with an explicit output grid size.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn process_image_with_grid(
+    input_bytes: &[u8],
+    k_colors: Option<u32>,
+    pixel_size_override: Option<f64>,
+    target_grid_width: u32,
+    target_grid_height: u32,
+) -> std::result::Result<Vec<u8>, wasm_bindgen::JsValue> {
+    let mut config = Config::default();
+    if let Some(k) = k_colors {
+        if k == 0 {
+            return Err(wasm_bindgen::JsValue::from_str(
+                "k_colors must be greater than 0",
+            ));
+        }
+        config.k_colors = k as usize;
+    }
+
+    config.pixel_size_override = pixel_size_override;
+    config.target_grid_width = Some(target_grid_width as usize);
+    config.target_grid_height = Some(target_grid_height as usize);
+
+    process_image_bytes_common(input_bytes, Some(config))
+        .map_err(|e| wasm_bindgen::JsValue::from(e))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn parse_args() -> Option<Config> {
@@ -220,6 +270,21 @@ fn parse_args() -> Option<Config> {
                 }
                 i += 2;
             }
+            "--grid-size" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!("Warning: --grid-size requires a value like 32x32");
+                    break;
+                };
+
+                match parse_grid_size(val) {
+                    Some((w, h)) => {
+                        config.target_grid_width = Some(w);
+                        config.target_grid_height = Some(h);
+                    }
+                    None => eprintln!("Warning: invalid --grid-size '{}', ignoring", val),
+                }
+                i += 2;
+            }
             arg if arg.starts_with("--") => {
                 eprintln!("Warning: unknown argument '{}', ignoring", arg);
                 i += 1;
@@ -238,6 +303,18 @@ fn parse_args() -> Option<Config> {
     }
 
     Some(config)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_grid_size(value: &str) -> Option<(usize, usize)> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let (w, h) = normalized.split_once('x')?;
+    let w = w.parse::<usize>().ok()?;
+    let h = h.parse::<usize>().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -269,6 +346,26 @@ fn validate_image_dimensions(width: u32, height: u32) -> Result<()> {
         return Err(PixelSnapperError::InvalidInput(
             "Image dimensions too large (max 10000x10000)".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_target_grid_size(
+    target_w: usize,
+    target_h: usize,
+    input_w: usize,
+    input_h: usize,
+) -> Result<()> {
+    if target_w == 0 || target_h == 0 {
+        return Err(PixelSnapperError::InvalidInput(
+            "Target grid dimensions must be greater than zero".to_string(),
+        ));
+    }
+    if target_w > input_w || target_h > input_h {
+        return Err(PixelSnapperError::InvalidInput(format!(
+            "Target grid size {}x{} cannot exceed input size {}x{}",
+            target_w, target_h, input_w, input_h
+        )));
     }
     Ok(())
 }
@@ -811,6 +908,61 @@ fn snap_uniform_cuts(
         cuts.push(limit);
     }
     cuts = sanitize_cuts(cuts, limit);
+    cuts
+}
+
+fn snap_grid_size_cuts(
+    profile: &[f64],
+    limit: usize,
+    target_cells: usize,
+    config: &Config,
+) -> Vec<usize> {
+    debug_assert!(target_cells > 0);
+    debug_assert!(target_cells <= limit);
+
+    let cell_width = limit as f64 / target_cells as f64;
+    let search_window =
+        (cell_width * config.walker_search_window_ratio).max(config.walker_min_search_window);
+    let mean_val = if profile.is_empty() {
+        0.0
+    } else {
+        profile.iter().sum::<f64>() / profile.len() as f64
+    };
+    let strength_threshold = mean_val * config.walker_strength_threshold;
+
+    let mut cuts = Vec::with_capacity(target_cells + 1);
+    cuts.push(0);
+
+    for idx in 1..target_cells {
+        let target = cell_width * idx as f64;
+        let prev = *cuts.last().unwrap();
+        let min_cut = prev + 1;
+        let max_cut = limit - (target_cells - idx);
+
+        let start = ((target - search_window).floor() as isize)
+            .max(min_cut as isize)
+            .max(0) as usize;
+        let end = ((target + search_window).ceil() as isize)
+            .min(max_cut as isize)
+            .max(start as isize) as usize;
+
+        let mut best_idx = target.round().clamp(min_cut as f64, max_cut as f64) as usize;
+        let mut best_val = -1.0;
+        for i in start..=end.min(profile.len().saturating_sub(1)) {
+            let v = profile.get(i).copied().unwrap_or(0.0);
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        if best_val < strength_threshold {
+            best_idx = target.round().clamp(min_cut as f64, max_cut as f64) as usize;
+        }
+
+        cuts.push(best_idx);
+    }
+
+    cuts.push(limit);
     cuts
 }
 

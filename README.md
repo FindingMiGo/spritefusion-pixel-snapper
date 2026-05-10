@@ -61,6 +61,14 @@ cargo run input.png output.png --pixel-size 8
 
 This is useful when the auto-detection doesn't match the expected grid size. The value must be between 1 and half the smallest image dimension.
 
+To force a specific final pixel-art grid resolution, use `--grid-size`:
+
+```bash
+cargo run input.png output.png --grid-size 32x32
+```
+
+This does not use linear interpolation. The input is split into the requested grid, snapped near detected pixel boundaries, and each output pixel uses the most common color in its source cell.
+
 ### 🌐 Web (WASM)
 
 ```bash
@@ -83,6 +91,9 @@ await init();
 
 // process_image(inputBytes, kColors?, pixelSizeOverride?)
 const outputBytes = process_image(inputBytes, 16);
+
+// process_image_with_grid(inputBytes, kColors?, pixelSizeOverride?, width, height)
+const fixedSizeOutputBytes = process_image_with_grid(inputBytes, 16, null, 32, 32);
 ```
 
 Pass `null` for any optional argument you want to leave on its default behavior.
