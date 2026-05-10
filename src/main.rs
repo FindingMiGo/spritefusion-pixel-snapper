@@ -20,6 +20,9 @@ pub struct Config {
     pub pixel_size_override: Option<f64>,
     pub target_grid_width: Option<usize>,
     pub target_grid_height: Option<usize>,
+    resample_mode: ResampleMode,
+    edge_weight: f64,
+    palette: Option<Vec<[u8; 3]>>,
     k_seed: u64,
     /// Input image path only used for CLI use
     #[allow(dead_code)]
@@ -57,6 +60,41 @@ impl Default for Config {
             pixel_size_override: None,
             target_grid_width: None,
             target_grid_height: None,
+            resample_mode: ResampleMode::Majority,
+            edge_weight: 1.0,
+            palette: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResampleMode {
+    Majority,
+    Center,
+    Mean,
+    EdgeAware,
+    PaletteAware,
+}
+
+impl ResampleMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "majority" | "vote" | "mode" => Some(Self::Majority),
+            "center" | "centre" => Some(Self::Center),
+            "mean" | "average" | "avg" => Some(Self::Mean),
+            "edge" | "edge-aware" | "edgeaware" => Some(Self::EdgeAware),
+            "palette" | "palette-aware" | "paletteaware" => Some(Self::PaletteAware),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Majority => "majority",
+            Self::Center => "center",
+            Self::Mean => "mean",
+            Self::EdgeAware => "edge-aware",
+            Self::PaletteAware => "palette-aware",
         }
     }
 }
@@ -128,6 +166,11 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
             "target grid width and height must both be provided".to_string(),
         ));
     }
+    if config.resample_mode == ResampleMode::PaletteAware && config.palette.is_none() {
+        return Err(PixelSnapperError::InvalidInput(
+            "palette-aware resampling requires --palette".to_string(),
+        ));
+    }
 
     let rgba_img = img.to_rgba8();
 
@@ -137,6 +180,8 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
     // Estimate step sizes
     let step_x_opt = estimate_step_size(&profile_x, &config);
     let step_y_opt = estimate_step_size(&profile_y, &config);
+    let autocorr_step_x_opt = estimate_step_size_autocorr(&profile_x);
+    let autocorr_step_y_opt = estimate_step_size_autocorr(&profile_y);
 
     // Resolve step sizes. Some instabilities so use sibling axis if one fails, or fallback if both fail
     let (step_x, step_y) = resolve_step_sizes(step_x_opt, step_y_opt, width, height, &config);
@@ -159,6 +204,19 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
             snap_grid_size_cuts(&profile_x, width as usize, target_w, &config),
             snap_grid_size_cuts(&profile_y, height as usize, target_h, &config),
         )
+    } else if config.pixel_size_override.is_none() {
+        select_grid_candidate(
+            &profile_x,
+            &profile_y,
+            step_x,
+            step_y,
+            width as usize,
+            height as usize,
+            &rgba_img,
+            &config,
+            autocorr_step_x_opt,
+            autocorr_step_y_opt,
+        )?
     } else {
         let raw_col_cuts = walk(&profile_x, step_x, width as usize, &config)?;
         let raw_row_cuts = walk(&profile_y, step_y, height as usize, &config)?;
@@ -177,7 +235,8 @@ fn process_image_bytes_common(input_bytes: &[u8], config: Option<Config>) -> Res
 
     println!("Output size: {}x{}", col_cuts.len() - 1, row_cuts.len() - 1);
 
-    let output_img = resample(&quantized_img, &col_cuts, &row_cuts)?;
+    println!("Resample mode: {}", config.resample_mode.label());
+    let output_img = resample(&quantized_img, &col_cuts, &row_cuts, &config)?;
 
     // Returns bytes for both implementations
     let mut output_bytes = Vec::new();
@@ -241,6 +300,58 @@ pub fn process_image_with_grid(
         .map_err(|e| wasm_bindgen::JsValue::from(e))
 }
 
+/// WASM entry point with explicit grid and resampling options.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn process_image_with_options(
+    input_bytes: &[u8],
+    k_colors: Option<u32>,
+    pixel_size_override: Option<f64>,
+    target_grid_width: Option<u32>,
+    target_grid_height: Option<u32>,
+    resample_mode: Option<String>,
+    edge_weight: Option<f64>,
+    palette: Option<String>,
+) -> std::result::Result<Vec<u8>, wasm_bindgen::JsValue> {
+    let mut config = Config::default();
+    if let Some(k) = k_colors {
+        if k == 0 {
+            return Err(wasm_bindgen::JsValue::from_str(
+                "k_colors must be greater than 0",
+            ));
+        }
+        config.k_colors = k as usize;
+    }
+
+    config.pixel_size_override = pixel_size_override;
+    config.target_grid_width = target_grid_width.map(|v| v as usize);
+    config.target_grid_height = target_grid_height.map(|v| v as usize);
+    if let Some(mode) = resample_mode {
+        config.resample_mode = ResampleMode::parse(&mode).ok_or_else(|| {
+            wasm_bindgen::JsValue::from_str(
+                "resample_mode must be one of: majority, center, mean, edge-aware",
+            )
+        })?;
+    }
+    if let Some(weight) = edge_weight {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(wasm_bindgen::JsValue::from_str(
+                "edge_weight must be a finite number greater than or equal to 0",
+            ));
+        }
+        config.edge_weight = weight.min(5.0);
+    }
+    if let Some(palette) = palette {
+        config.palette =
+            Some(parse_palette_colors(&palette).map_err(|e| {
+                wasm_bindgen::JsValue::from_str(&format!("invalid palette: {}", e))
+            })?);
+    }
+
+    process_image_bytes_common(input_bytes, Some(config))
+        .map_err(|e| wasm_bindgen::JsValue::from(e))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn parse_args() -> Option<Config> {
@@ -285,6 +396,46 @@ fn parse_args() -> Option<Config> {
                 }
                 i += 2;
             }
+            "--resample" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!(
+                        "Warning: --resample requires one of majority, center, mean, edge-aware, palette-aware"
+                    );
+                    break;
+                };
+
+                match ResampleMode::parse(val) {
+                    Some(mode) => config.resample_mode = mode,
+                    None => eprintln!("Warning: invalid --resample '{}', ignoring", val),
+                }
+                i += 2;
+            }
+            "--edge-weight" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!("Warning: --edge-weight requires a finite non-negative value");
+                    break;
+                };
+
+                match val.parse::<f64>() {
+                    Ok(weight) if weight.is_finite() && weight >= 0.0 => {
+                        config.edge_weight = weight.min(5.0)
+                    }
+                    _ => eprintln!("Warning: invalid --edge-weight '{}', ignoring", val),
+                }
+                i += 2;
+            }
+            "--palette" => {
+                let Some(val) = args.get(i + 1) else {
+                    eprintln!("Warning: --palette requires a file path or #rrggbb color list");
+                    break;
+                };
+
+                match load_palette_arg(val) {
+                    Ok(palette) => config.palette = Some(palette),
+                    Err(err) => eprintln!("Warning: invalid --palette '{}': {}", val, err),
+                }
+                i += 2;
+            }
             arg if arg.starts_with("--") => {
                 eprintln!("Warning: unknown argument '{}', ignoring", arg);
                 i += 1;
@@ -315,6 +466,82 @@ fn parse_grid_size(value: &str) -> Option<(usize, usize)> {
         return None;
     }
     Some((w, h))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_palette_arg(value: &str) -> Result<Vec<[u8; 3]>> {
+    let content = if std::path::Path::new(value).exists() {
+        std::fs::read_to_string(value).map_err(|e| {
+            PixelSnapperError::InvalidInput(format!("failed to read palette file: {}", e))
+        })?
+    } else {
+        value.to_string()
+    };
+    parse_palette_colors(&content)
+}
+
+fn parse_palette_colors(value: &str) -> Result<Vec<[u8; 3]>> {
+    let mut colors = Vec::new();
+    for line in value.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.contains(',') {
+            let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+            if parts.len() >= 6 {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    parts[3].parse::<u8>(),
+                    parts[4].parse::<u8>(),
+                    parts[5].parse::<u8>(),
+                ) {
+                    colors.push([r, g, b]);
+                    continue;
+                }
+            }
+            if parts.len() >= 3 {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    parts[0].parse::<u8>(),
+                    parts[1].parse::<u8>(),
+                    parts[2].parse::<u8>(),
+                ) {
+                    colors.push([r, g, b]);
+                    continue;
+                }
+            }
+        }
+
+        for token in line.split(|c: char| c.is_whitespace() || c == ';' || c == ',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(color) = parse_hex_color(token) {
+                colors.push(color);
+            }
+        }
+    }
+
+    colors.sort_unstable();
+    colors.dedup();
+    if colors.is_empty() {
+        return Err(PixelSnapperError::InvalidInput(
+            "palette must contain at least one RGB color".to_string(),
+        ));
+    }
+    Ok(colors)
+}
+
+fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some([r, g, b])
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -375,6 +602,9 @@ fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
         return Err(PixelSnapperError::InvalidInput(
             "Number of colors must be greater than 0".to_string(),
         ));
+    }
+    if let Some(palette) = &config.palette {
+        return Ok(map_image_to_palette(img, palette));
     }
 
     let opaque_pixels: Vec<[f32; 3]> = img
@@ -510,6 +740,36 @@ fn quantize_image(img: &RgbaImage, config: &Config) -> Result<RgbaImage> {
     Ok(new_img)
 }
 
+fn map_image_to_palette(img: &RgbaImage, palette: &[[u8; 3]]) -> RgbaImage {
+    let mut new_img = RgbaImage::new(img.width(), img.height());
+    for (x, y, pixel) in img.enumerate_pixels() {
+        if pixel[3] == 0 {
+            new_img.put_pixel(x, y, *pixel);
+            continue;
+        }
+        let best =
+            nearest_palette_color([pixel[0] as f64, pixel[1] as f64, pixel[2] as f64], palette);
+        new_img.put_pixel(x, y, Rgba([best[0], best[1], best[2], pixel[3]]));
+    }
+    new_img
+}
+
+fn nearest_palette_color(rgb: [f64; 3], palette: &[[u8; 3]]) -> [u8; 3] {
+    let mut best = palette.first().copied().unwrap_or([0, 0, 0]);
+    let mut best_dist = f64::MAX;
+    for &candidate in palette {
+        let dr = rgb[0] - candidate[0] as f64;
+        let dg = rgb[1] - candidate[1] as f64;
+        let db = rgb[2] - candidate[2] as f64;
+        let dist = dr * dr + dg * dg + db * db;
+        if dist < best_dist {
+            best_dist = dist;
+            best = candidate;
+        }
+    }
+    best
+}
+
 fn compute_profiles(img: &RgbaImage) -> Result<(Vec<f64>, Vec<f64>)> {
     let (w, h) = img.dimensions();
 
@@ -594,6 +854,39 @@ fn estimate_step_size(profile: &[f64], config: &Config) -> Option<f64> {
     // Median
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     Some(diffs[diffs.len() / 2])
+}
+
+fn estimate_step_size_autocorr(profile: &[f64]) -> Option<f64> {
+    if profile.len() < 6 {
+        return None;
+    }
+    let mean = profile.iter().sum::<f64>() / profile.len() as f64;
+    let centered: Vec<f64> = profile.iter().map(|value| value - mean).collect();
+    let energy = centered.iter().map(|value| value * value).sum::<f64>();
+    if energy <= 0.0 {
+        return None;
+    }
+
+    let max_lag = (profile.len() / 2).min(256);
+    let mut best_lag = 0usize;
+    let mut best_score = f64::MIN;
+    for lag in 2..=max_lag {
+        let mut score = 0.0;
+        let mut count = 0usize;
+        for i in 0..profile.len() - lag {
+            score += centered[i] * centered[i + lag];
+            count += 1;
+        }
+        if count > 0 {
+            score /= count as f64;
+        }
+        if score > best_score {
+            best_score = score;
+            best_lag = lag;
+        }
+    }
+
+    (best_lag > 0 && best_score > 0.0).then_some(best_lag as f64)
 }
 
 fn resolve_step_sizes(
@@ -700,6 +993,570 @@ fn stabilize_both_axes(
     } else {
         (col_cuts_pass1, row_cuts_pass1)
     }
+}
+
+struct GridCandidate {
+    col_cuts: Vec<usize>,
+    row_cuts: Vec<usize>,
+    source: &'static str,
+    score: f64,
+}
+
+fn select_grid_candidate(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    step_x: f64,
+    step_y: f64,
+    width: usize,
+    height: usize,
+    source_img: &RgbaImage,
+    config: &Config,
+    autocorr_step_x_opt: Option<f64>,
+    autocorr_step_y_opt: Option<f64>,
+) -> Result<(Vec<usize>, Vec<usize>)> {
+    let mut candidates = Vec::new();
+
+    if let Some(candidate) = build_walk_candidate(
+        profile_x, profile_y, step_x, step_y, width, height, config, step_x, step_y, "detected",
+        source_img,
+    )? {
+        candidates.push(candidate);
+    }
+
+    if autocorr_step_x_opt.is_some() || autocorr_step_y_opt.is_some() {
+        let (autocorr_step_x, autocorr_step_y) = resolve_step_sizes(
+            autocorr_step_x_opt,
+            autocorr_step_y_opt,
+            width as u32,
+            height as u32,
+            config,
+        );
+        let ratio_x = autocorr_step_x / step_x.max(1.0);
+        let ratio_y = autocorr_step_y / step_y.max(1.0);
+        if (0.75..=1.25).contains(&ratio_x) && (0.75..=1.25).contains(&ratio_y) {
+            if let Some(candidate) = build_walk_candidate(
+                profile_x,
+                profile_y,
+                autocorr_step_x,
+                autocorr_step_y,
+                width,
+                height,
+                config,
+                step_x,
+                step_y,
+                "autocorr",
+                source_img,
+            )? {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    if let Some(candidate) = build_line_mesh_candidate(
+        profile_x, profile_y, step_x, step_y, width, height, config, source_img,
+    ) {
+        candidates.push(candidate);
+    }
+
+    if let Some(candidate) = build_reconstruction_candidate(
+        source_img, profile_x, profile_y, step_x, step_y, width, height,
+    ) {
+        candidates.push(candidate);
+    }
+
+    for &(multiplier, source) in &[
+        (0.9, "slightly-smaller-step"),
+        (1.1, "slightly-larger-step"),
+    ] {
+        let candidate_step_x = step_x * multiplier;
+        let candidate_step_y = step_y * multiplier;
+        if candidate_step_x >= 1.0 && candidate_step_y >= 1.0 {
+            if let Some(candidate) = build_walk_candidate(
+                profile_x,
+                profile_y,
+                candidate_step_x,
+                candidate_step_y,
+                width,
+                height,
+                config,
+                step_x,
+                step_y,
+                source,
+                source_img,
+            )? {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    let expected_segments = (width.min(height) as f64 / step_x.max(step_y).max(1.0)).round();
+    for &(segments, source) in &[(16usize, "fixed-16"), (32, "fixed-32"), (64, "fixed-64")] {
+        let ratio = segments as f64 / expected_segments.max(1.0);
+        if segments <= width.min(height) && (0.75..=1.25).contains(&ratio) {
+            let candidate_step_x = width as f64 / segments as f64;
+            let candidate_step_y = height as f64 / segments as f64;
+            if let Some(candidate) = build_uniform_candidate(
+                profile_x,
+                profile_y,
+                candidate_step_x,
+                candidate_step_y,
+                width,
+                height,
+                config,
+                step_x,
+                step_y,
+                source,
+                source_img,
+            ) {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    candidates.dedup_by(|a, b| {
+        a.col_cuts.len() == b.col_cuts.len() && a.row_cuts.len() == b.row_cuts.len()
+    });
+
+    let best = candidates.into_iter().next().ok_or_else(|| {
+        PixelSnapperError::ProcessingError("No valid grid candidates found".to_string())
+    })?;
+    println!(
+        "Grid candidate: {} (score {:.3}, size {}x{})",
+        best.source,
+        best.score,
+        best.col_cuts.len().saturating_sub(1),
+        best.row_cuts.len().saturating_sub(1)
+    );
+    Ok((best.col_cuts, best.row_cuts))
+}
+
+fn build_walk_candidate(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    step_x: f64,
+    step_y: f64,
+    width: usize,
+    height: usize,
+    config: &Config,
+    score_expected_step_x: f64,
+    score_expected_step_y: f64,
+    source: &'static str,
+    source_img: &RgbaImage,
+) -> Result<Option<GridCandidate>> {
+    let raw_col_cuts = walk(profile_x, step_x, width, config)?;
+    let raw_row_cuts = walk(profile_y, step_y, height, config)?;
+    let (col_cuts, row_cuts) = stabilize_both_axes(
+        profile_x,
+        profile_y,
+        raw_col_cuts,
+        raw_row_cuts,
+        width,
+        height,
+        config,
+    );
+    Ok(make_grid_candidate(
+        profile_x,
+        profile_y,
+        col_cuts,
+        row_cuts,
+        score_expected_step_x,
+        score_expected_step_y,
+        width,
+        height,
+        source,
+        source_img,
+    ))
+}
+
+fn build_uniform_candidate(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    step_x: f64,
+    step_y: f64,
+    width: usize,
+    height: usize,
+    config: &Config,
+    score_expected_step_x: f64,
+    score_expected_step_y: f64,
+    source: &'static str,
+    source_img: &RgbaImage,
+) -> Option<GridCandidate> {
+    let col_cuts = snap_uniform_cuts(profile_x, width, step_x, config, config.min_cuts_per_axis);
+    let row_cuts = snap_uniform_cuts(profile_y, height, step_y, config, config.min_cuts_per_axis);
+    make_grid_candidate(
+        profile_x,
+        profile_y,
+        col_cuts,
+        row_cuts,
+        score_expected_step_x,
+        score_expected_step_y,
+        width,
+        height,
+        source,
+        source_img,
+    )
+}
+
+fn build_line_mesh_candidate(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    expected_step_x: f64,
+    expected_step_y: f64,
+    width: usize,
+    height: usize,
+    _config: &Config,
+    source_img: &RgbaImage,
+) -> Option<GridCandidate> {
+    let col_lines = detect_strong_line_positions(profile_x, width)?;
+    let row_lines = detect_strong_line_positions(profile_y, height)?;
+    let col_step = median_spacing(&col_lines).unwrap_or(expected_step_x);
+    let row_step = median_spacing(&row_lines).unwrap_or(expected_step_y);
+    if !step_close(col_step, expected_step_x) || !step_close(row_step, expected_step_y) {
+        return None;
+    }
+
+    let col_cuts = homogenize_lines(&col_lines, col_step, width);
+    let row_cuts = homogenize_lines(&row_lines, row_step, height);
+    make_grid_candidate(
+        profile_x,
+        profile_y,
+        col_cuts,
+        row_cuts,
+        expected_step_x,
+        expected_step_y,
+        width,
+        height,
+        "line-mesh",
+        source_img,
+    )
+}
+
+fn build_reconstruction_candidate(
+    source_img: &RgbaImage,
+    profile_x: &[f64],
+    profile_y: &[f64],
+    expected_step_x: f64,
+    expected_step_y: f64,
+    width: usize,
+    height: usize,
+) -> Option<GridCandidate> {
+    let base_step = ((expected_step_x + expected_step_y) / 2.0).round();
+    if !base_step.is_finite() || base_step < 2.0 {
+        return None;
+    }
+
+    let mut best: Option<(Vec<usize>, Vec<usize>, f64)> = None;
+    for step_delta in [-1.0, 0.0, 1.0] {
+        let step = (base_step + step_delta).max(2.0);
+        if !step_close(step, expected_step_x) || !step_close(step, expected_step_y) {
+            continue;
+        }
+        let max_offset = (step as usize).min(8);
+        let stride = (max_offset / 3).max(1);
+        for offset_x in (0..max_offset).step_by(stride) {
+            let col_cuts = make_uniform_offset_cuts(step, offset_x as f64, width);
+            for offset_y in (0..max_offset).step_by(stride) {
+                let row_cuts = make_uniform_offset_cuts(step, offset_y as f64, height);
+                let error = reconstruction_error(source_img, &col_cuts, &row_cuts);
+                if best
+                    .as_ref()
+                    .map(|(_, _, best_error)| error < *best_error)
+                    .unwrap_or(true)
+                {
+                    best = Some((col_cuts.clone(), row_cuts, error));
+                }
+            }
+        }
+    }
+
+    let (col_cuts, row_cuts, _) = best?;
+    make_grid_candidate(
+        profile_x,
+        profile_y,
+        col_cuts,
+        row_cuts,
+        expected_step_x,
+        expected_step_y,
+        width,
+        height,
+        "reconstruction",
+        source_img,
+    )
+}
+
+fn make_grid_candidate(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    col_cuts: Vec<usize>,
+    row_cuts: Vec<usize>,
+    expected_step_x: f64,
+    expected_step_y: f64,
+    width: usize,
+    height: usize,
+    source: &'static str,
+    source_img: &RgbaImage,
+) -> Option<GridCandidate> {
+    if col_cuts.len() < 2 || row_cuts.len() < 2 {
+        return None;
+    }
+    let score = score_grid_candidate(
+        profile_x,
+        profile_y,
+        &col_cuts,
+        &row_cuts,
+        expected_step_x,
+        expected_step_y,
+        width,
+        height,
+        source_img,
+    );
+    if !score.is_finite() {
+        return None;
+    }
+    Some(GridCandidate {
+        col_cuts,
+        row_cuts,
+        source,
+        score,
+    })
+}
+
+fn score_grid_candidate(
+    profile_x: &[f64],
+    profile_y: &[f64],
+    col_cuts: &[usize],
+    row_cuts: &[usize],
+    expected_step_x: f64,
+    expected_step_y: f64,
+    width: usize,
+    height: usize,
+    source_img: &RgbaImage,
+) -> f64 {
+    let edge_score =
+        normalized_edge_score(profile_x, col_cuts) + normalized_edge_score(profile_y, row_cuts);
+    let regularity_penalty = cut_irregularity(col_cuts) + cut_irregularity(row_cuts);
+    let size_penalty = grid_size_penalty(col_cuts, expected_step_x, width)
+        + grid_size_penalty(row_cuts, expected_step_y, height);
+    let reconstruction_penalty = reconstruction_error(source_img, col_cuts, row_cuts);
+    edge_score - 0.75 * regularity_penalty - 1.5 * size_penalty - 2.0 * reconstruction_penalty
+}
+
+fn normalized_edge_score(profile: &[f64], cuts: &[usize]) -> f64 {
+    if profile.is_empty() || cuts.len() < 3 {
+        return 0.0;
+    }
+    let mean = profile.iter().sum::<f64>() / profile.len() as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for &cut in &cuts[1..cuts.len() - 1] {
+        if let Some(value) = profile.get(cut) {
+            total += *value / mean;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f64
+    }
+}
+
+fn cut_irregularity(cuts: &[usize]) -> f64 {
+    if cuts.len() < 3 {
+        return 0.0;
+    }
+    let spans: Vec<f64> = cuts
+        .windows(2)
+        .filter_map(|w| (w[1] > w[0]).then_some((w[1] - w[0]) as f64))
+        .collect();
+    if spans.len() < 2 {
+        return 0.0;
+    }
+    let mean = spans.iter().sum::<f64>() / spans.len() as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let variance = spans
+        .iter()
+        .map(|span| {
+            let delta = span - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / spans.len() as f64;
+    variance.sqrt() / mean
+}
+
+fn grid_size_penalty(cuts: &[usize], expected_step: f64, limit: usize) -> f64 {
+    if expected_step <= 0.0 || !expected_step.is_finite() || cuts.len() < 2 {
+        return 0.0;
+    }
+    let expected_cells = limit as f64 / expected_step;
+    let actual_cells = cuts.len().saturating_sub(1) as f64;
+    if expected_cells <= 0.0 || actual_cells <= 0.0 {
+        return 0.0;
+    }
+    let ratio = actual_cells / expected_cells;
+    if (0.75..=1.25).contains(&ratio) {
+        0.0
+    } else {
+        ratio.log2().abs()
+    }
+}
+
+fn detect_strong_line_positions(profile: &[f64], limit: usize) -> Option<Vec<usize>> {
+    if profile.len() < 3 || limit < 2 {
+        return None;
+    }
+    let mean = profile.iter().sum::<f64>() / profile.len() as f64;
+    let variance = profile
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / profile.len() as f64;
+    let threshold = mean + variance.sqrt();
+
+    let mut lines = vec![0];
+    let mut i = 1usize;
+    while i + 1 < profile.len() {
+        if profile[i] < threshold {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut best = i;
+        let mut best_value = profile[i];
+        while i + 1 < profile.len() && profile[i] >= threshold {
+            if profile[i] > best_value {
+                best = i;
+                best_value = profile[i];
+            }
+            i += 1;
+        }
+        if best > 0 && best < limit {
+            let last = *lines.last().unwrap();
+            if best.saturating_sub(last) > 1 {
+                lines.push(best);
+            } else if let Some(last_mut) = lines.last_mut() {
+                *last_mut = ((*last_mut + start + best) / 3).min(limit);
+            }
+        }
+    }
+    if *lines.last().unwrap() != limit {
+        lines.push(limit);
+    }
+    (lines.len() >= 4).then_some(lines)
+}
+
+fn median_spacing(lines: &[usize]) -> Option<f64> {
+    let mut diffs: Vec<usize> = lines
+        .windows(2)
+        .filter_map(|w| (w[1] > w[0]).then_some(w[1] - w[0]))
+        .collect();
+    if diffs.is_empty() {
+        return None;
+    }
+    diffs.sort_unstable();
+    Some(diffs[diffs.len() / 2] as f64)
+}
+
+fn homogenize_lines(lines: &[usize], step: f64, limit: usize) -> Vec<usize> {
+    if lines.len() < 2 || step < 1.0 || !step.is_finite() {
+        return vec![0, limit];
+    }
+    let offset = lines
+        .iter()
+        .copied()
+        .find(|line| *line > 0 && *line < limit)
+        .unwrap_or(0) as f64;
+    make_uniform_offset_cuts(step, offset, limit)
+}
+
+fn make_uniform_offset_cuts(step: f64, offset: f64, limit: usize) -> Vec<usize> {
+    let mut cuts = vec![0, limit];
+    let mut pos = offset.rem_euclid(step);
+    if pos < 1.0 {
+        pos += step;
+    }
+    while pos < limit as f64 {
+        let cut = pos.round() as usize;
+        if cut > 0 && cut < limit {
+            cuts.push(cut);
+        }
+        pos += step;
+    }
+    sanitize_cuts(cuts, limit)
+}
+
+fn step_close(candidate: f64, expected: f64) -> bool {
+    if candidate <= 0.0 || expected <= 0.0 || !candidate.is_finite() || !expected.is_finite() {
+        return false;
+    }
+    let ratio = candidate / expected;
+    (0.75..=1.25).contains(&ratio)
+}
+
+fn reconstruction_error(img: &RgbaImage, col_cuts: &[usize], row_cuts: &[usize]) -> f64 {
+    if col_cuts.len() < 2 || row_cuts.len() < 2 {
+        return f64::INFINITY;
+    }
+    let width = img.width() as usize;
+    let height = img.height() as usize;
+    let mut total_error = 0.0;
+    let mut total_count = 0usize;
+
+    for rows in row_cuts.windows(2) {
+        let y0 = rows[0].min(height);
+        let y1 = rows[1].min(height);
+        if y1 <= y0 {
+            continue;
+        }
+        for cols in col_cuts.windows(2) {
+            let x0 = cols[0].min(width);
+            let x1 = cols[1].min(width);
+            if x1 <= x0 {
+                continue;
+            }
+
+            let mut sums = [0.0f64; 3];
+            let mut sq_sums = [0.0f64; 3];
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = img.get_pixel(x as u32, y as u32).0;
+                    if p[3] == 0 {
+                        continue;
+                    }
+                    for channel in 0..3 {
+                        let value = p[channel] as f64 / 255.0;
+                        sums[channel] += value;
+                        sq_sums[channel] += value * value;
+                    }
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            for channel in 0..3 {
+                total_error += sq_sums[channel] - sums[channel] * sums[channel] / count as f64;
+            }
+            total_count += count;
+        }
+    }
+
+    if total_count == 0 {
+        return f64::INFINITY;
+    }
+    let cells = col_cuts.len().saturating_sub(1) * row_cuts.len().saturating_sub(1);
+    total_error / total_count as f64 + 0.02 * cells as f64 / total_count as f64
 }
 
 // Tried uniform grid instead of an elastic-ish walker, but the result was a bit worse.
@@ -966,7 +1823,7 @@ fn snap_grid_size_cuts(
     cuts
 }
 
-fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage> {
+fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize], config: &Config) -> Result<RgbaImage> {
     if cols.len() < 2 || rows.len() < 2 {
         return Err(PixelSnapperError::ProcessingError(
             "Insufficient grid cuts for resampling".to_string(),
@@ -976,47 +1833,216 @@ fn resample(img: &RgbaImage, cols: &[usize], rows: &[usize]) -> Result<RgbaImage
     let out_w = (cols.len().max(1) - 1) as u32;
     let out_h = (rows.len().max(1) - 1) as u32;
     let mut final_img: RgbaImage = ImageBuffer::new(out_w, out_h);
+    let img_w = img.width() as usize;
+    let img_h = img.height() as usize;
 
     for (y_i, w_y) in rows.windows(2).enumerate() {
         for (x_i, w_x) in cols.windows(2).enumerate() {
-            let ys = w_y[0];
-            let ye = w_y[1];
-            let xs = w_x[0];
-            let xe = w_x[1];
+            let ys = w_y[0].min(img_h);
+            let ye = w_y[1].min(img_h);
+            let xs = w_x[0].min(img_w);
+            let xe = w_x[1].min(img_w);
 
             if xe <= xs || ye <= ys {
                 continue;
             }
 
-            let mut counts: HashMap<[u8; 4], usize> = HashMap::new();
-
-            for y in ys..ye {
-                for x in xs..xe {
-                    if x < img.width() as usize && y < img.height() as usize {
-                        let p = img.get_pixel(x as u32, y as u32).0;
-                        *counts.entry(p).or_insert(0) += 1;
-                    }
+            let best_pixel = match config.resample_mode {
+                ResampleMode::Majority => resample_majority(img, xs, xe, ys, ye),
+                ResampleMode::Center => resample_center(img, xs, xe, ys, ye),
+                ResampleMode::Mean => resample_mean(img, xs, xe, ys, ye),
+                ResampleMode::EdgeAware => {
+                    resample_edge_aware(img, xs, xe, ys, ye, config.edge_weight)
                 }
-            }
-
-            let mut best_pixel = [0, 0, 0, 0];
-
-            let mut candidates: Vec<([u8; 4], usize)> = counts.into_iter().collect();
-            candidates.sort_by(|a, b| {
-                let count_cmp = b.1.cmp(&a.1);
-                if count_cmp == Ordering::Equal {
-                    a.0.cmp(&b.0)
-                } else {
-                    count_cmp
+                ResampleMode::PaletteAware => {
+                    resample_palette_aware(img, xs, xe, ys, ye, config.palette.as_deref().unwrap())
                 }
-            });
-
-            if let Some(winner) = candidates.first() {
-                best_pixel = winner.0;
-            }
+            };
 
             final_img.put_pixel(x_i as u32, y_i as u32, Rgba(best_pixel));
         }
     }
     Ok(final_img)
+}
+
+fn resample_majority(img: &RgbaImage, xs: usize, xe: usize, ys: usize, ye: usize) -> [u8; 4] {
+    let mut counts: HashMap<[u8; 4], usize> = HashMap::new();
+
+    for y in ys..ye {
+        for x in xs..xe {
+            let p = img.get_pixel(x as u32, y as u32).0;
+            *counts.entry(p).or_insert(0) += 1;
+        }
+    }
+
+    let mut candidates: Vec<([u8; 4], usize)> = counts.into_iter().collect();
+    candidates.sort_by(|a, b| {
+        let count_cmp = b.1.cmp(&a.1);
+        if count_cmp == Ordering::Equal {
+            a.0.cmp(&b.0)
+        } else {
+            count_cmp
+        }
+    });
+
+    candidates
+        .first()
+        .map(|winner| winner.0)
+        .unwrap_or([0, 0, 0, 0])
+}
+
+fn resample_center(img: &RgbaImage, xs: usize, xe: usize, ys: usize, ye: usize) -> [u8; 4] {
+    let cx = ((xs + xe.saturating_sub(1)) / 2).min(img.width().saturating_sub(1) as usize);
+    let cy = ((ys + ye.saturating_sub(1)) / 2).min(img.height().saturating_sub(1) as usize);
+    let pixel = img.get_pixel(cx as u32, cy as u32).0;
+    if pixel[3] == 0 {
+        resample_majority(img, xs, xe, ys, ye)
+    } else {
+        pixel
+    }
+}
+
+fn resample_mean(img: &RgbaImage, xs: usize, xe: usize, ys: usize, ye: usize) -> [u8; 4] {
+    let mut weighted_rgb = [0.0f64; 3];
+    let mut total_alpha = 0.0f64;
+    let mut alpha_sum = 0.0f64;
+    let mut count = 0usize;
+
+    for y in ys..ye {
+        for x in xs..xe {
+            let p = img.get_pixel(x as u32, y as u32).0;
+            let alpha = p[3] as f64 / 255.0;
+            weighted_rgb[0] += p[0] as f64 * alpha;
+            weighted_rgb[1] += p[1] as f64 * alpha;
+            weighted_rgb[2] += p[2] as f64 * alpha;
+            total_alpha += alpha;
+            alpha_sum += p[3] as f64;
+            count += 1;
+        }
+    }
+
+    if total_alpha <= 0.0 || count == 0 {
+        return [0, 0, 0, 0];
+    }
+
+    [
+        clamp_u8(weighted_rgb[0] / total_alpha),
+        clamp_u8(weighted_rgb[1] / total_alpha),
+        clamp_u8(weighted_rgb[2] / total_alpha),
+        clamp_u8(alpha_sum / count as f64),
+    ]
+}
+
+fn resample_edge_aware(
+    img: &RgbaImage,
+    xs: usize,
+    xe: usize,
+    ys: usize,
+    ye: usize,
+    edge_weight: f64,
+) -> [u8; 4] {
+    let mut counts: HashMap<[u8; 4], f64> = HashMap::new();
+    let width = img.width() as usize;
+    let height = img.height() as usize;
+    let edge_weight = edge_weight.max(0.0);
+
+    for y in ys..ye {
+        for x in xs..xe {
+            let p = img.get_pixel(x as u32, y as u32).0;
+            let center = luminance(p);
+            let left = luminance(img.get_pixel(x.saturating_sub(1) as u32, y as u32).0);
+            let right = luminance(img.get_pixel((x + 1).min(width - 1) as u32, y as u32).0);
+            let up = luminance(img.get_pixel(x as u32, y.saturating_sub(1) as u32).0);
+            let down = luminance(img.get_pixel(x as u32, (y + 1).min(height - 1) as u32).0);
+            let grad = (center - left).abs()
+                + (center - right).abs()
+                + (center - up).abs()
+                + (center - down).abs();
+            let normalized = (grad / (4.0 * 255.0)).min(1.0);
+            let vote_weight = 1.0 + edge_weight * normalized;
+            *counts.entry(p).or_insert(0.0) += vote_weight;
+        }
+    }
+
+    let mut candidates: Vec<([u8; 4], f64)> = counts.into_iter().collect();
+    candidates.sort_by(|a, b| {
+        let count_cmp = b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal);
+        if count_cmp == Ordering::Equal {
+            a.0.cmp(&b.0)
+        } else {
+            count_cmp
+        }
+    });
+
+    candidates
+        .first()
+        .map(|winner| winner.0)
+        .unwrap_or([0, 0, 0, 0])
+}
+
+fn resample_palette_aware(
+    img: &RgbaImage,
+    xs: usize,
+    xe: usize,
+    ys: usize,
+    ye: usize,
+    palette: &[[u8; 3]],
+) -> [u8; 4] {
+    let mean = resample_mean_rgb_alpha(img, xs, xe, ys, ye);
+    let Some((rgb, alpha)) = mean else {
+        return [0, 0, 0, 0];
+    };
+    let best = nearest_palette_color(rgb, palette);
+    [best[0], best[1], best[2], alpha]
+}
+
+fn resample_mean_rgb_alpha(
+    img: &RgbaImage,
+    xs: usize,
+    xe: usize,
+    ys: usize,
+    ye: usize,
+) -> Option<([f64; 3], u8)> {
+    let mut weighted_rgb = [0.0f64; 3];
+    let mut total_alpha = 0.0f64;
+    let mut alpha_sum = 0.0f64;
+    let mut count = 0usize;
+
+    for y in ys..ye {
+        for x in xs..xe {
+            let p = img.get_pixel(x as u32, y as u32).0;
+            let alpha = p[3] as f64 / 255.0;
+            weighted_rgb[0] += p[0] as f64 * alpha;
+            weighted_rgb[1] += p[1] as f64 * alpha;
+            weighted_rgb[2] += p[2] as f64 * alpha;
+            total_alpha += alpha;
+            alpha_sum += p[3] as f64;
+            count += 1;
+        }
+    }
+
+    if total_alpha <= 0.0 || count == 0 {
+        return None;
+    }
+
+    Some((
+        [
+            weighted_rgb[0] / total_alpha,
+            weighted_rgb[1] / total_alpha,
+            weighted_rgb[2] / total_alpha,
+        ],
+        clamp_u8(alpha_sum / count as f64),
+    ))
+}
+
+fn luminance(pixel: [u8; 4]) -> f64 {
+    if pixel[3] == 0 {
+        0.0
+    } else {
+        0.299 * pixel[0] as f64 + 0.587 * pixel[1] as f64 + 0.114 * pixel[2] as f64
+    }
+}
+
+fn clamp_u8(value: f64) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
 }
